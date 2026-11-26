@@ -246,8 +246,179 @@ var _ = Describe("Linux namespace operations", func() {
 				err = createdNetNS.Close()
 				Expect(err).NotTo(HaveOccurred())
 
+				// Repeated closes are idempotent and never error so
+				// callers can safely defer them on shared handles.
 				err = createdNetNS.Close()
+				Expect(err).NotTo(HaveOccurred())
+				err = createdNetNS.Close()
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			It("should be safe to close concurrently from many goroutines", func() {
+				createdNetNS, err := testutils.NewNS()
+				Expect(err).NotTo(HaveOccurred())
+				defer testutils.UnmountNS(createdNetNS)
+
+				closers := 50
+				var wg sync.WaitGroup
+				wg.Add(closers)
+				errCh := make(chan error, closers)
+				for i := 0; i < closers; i++ {
+					go func() {
+						defer wg.Done()
+						errCh <- createdNetNS.Close()
+					}()
+				}
+				wg.Wait()
+				close(errCh)
+
+				errorCount := 0
+				for closeErr := range errCh {
+					if closeErr != nil {
+						errorCount++
+					}
+				}
+				Expect(errorCount).To(BeZero())
+
+				// A closed handle must refuse further namespace operations.
+				err = createdNetNS.Set()
 				Expect(err).To(HaveOccurred())
+				err = createdNetNS.Do(func(ns.NetNS) error { return nil })
+				Expect(err).To(HaveOccurred())
+			})
+		})
+
+		Describe("restoring the namespace under failures and panics", func() {
+			It("recovers a panicking callback, reports it and restores the namespace", func() {
+				preTestInode, err := getInodeCurNetNS()
+				Expect(err).NotTo(HaveOccurred())
+
+				err = targetNetNS.Do(func(ns.NetNS) error {
+					panic("potato")
+				})
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("panic in netns callback"))
+				Expect(err.Error()).To(ContainSubstring("potato"))
+
+				// The calling goroutine's thread must be back in the
+				// original namespace, not stranded in the target one.
+				postTestInode, err := getInodeCurNetNS()
+				Expect(err).NotTo(HaveOccurred())
+				Expect(postTestInode).To(Equal(preTestInode))
+			})
+
+			It("does not crash when callbacks panic concurrently", func() {
+				concurrency := 100
+				var wg sync.WaitGroup
+				wg.Add(concurrency)
+				for i := 0; i < concurrency; i++ {
+					go func(i int) {
+						defer wg.Done()
+						defer GinkgoRecover()
+
+						err := targetNetNS.Do(func(ns.NetNS) error {
+							if i%2 == 0 {
+								panic("concurrent potato")
+							}
+							return errors.New("plain error")
+						})
+						Expect(err).To(HaveOccurred())
+					}(i)
+				}
+				wg.Wait()
+			})
+
+			It("keeps switching and restoring correctly under heavy concurrency", func() {
+				origInode, err := getInodeCurNetNS()
+				Expect(err).NotTo(HaveOccurred())
+				targetInode, err := getInodeNS(targetNetNS)
+				Expect(err).NotTo(HaveOccurred())
+
+				concurrency := 200
+				var wg sync.WaitGroup
+				wg.Add(concurrency)
+				for i := 0; i < concurrency; i++ {
+					go func() {
+						defer wg.Done()
+						defer GinkgoRecover()
+
+						err := targetNetNS.Do(func(ns.NetNS) error {
+							inode, err := getInodeCurNetNS()
+							Expect(err).NotTo(HaveOccurred())
+							Expect(inode).To(Equal(targetInode))
+							return nil
+						})
+						Expect(err).NotTo(HaveOccurred())
+
+						// Every Do must leave the caller back in its
+						// original namespace.
+						inode, err := getInodeCurNetNS()
+						Expect(err).NotTo(HaveOccurred())
+						Expect(inode).To(Equal(origInode))
+					}()
+				}
+				wg.Wait()
+			})
+
+			It("supports nested Do calls without deadlocking", func() {
+				targetInode, err := getInodeNS(targetNetNS)
+				Expect(err).NotTo(HaveOccurred())
+
+				err = targetNetNS.Do(func(ns.NetNS) error {
+					defer GinkgoRecover()
+
+					return originalNetNS.Do(func(hostNS ns.NetNS) error {
+						defer GinkgoRecover()
+
+						originalInode, err := getInodeNS(originalNetNS)
+						Expect(err).NotTo(HaveOccurred())
+						current, err := getInodeCurNetNS()
+						Expect(err).NotTo(HaveOccurred())
+						Expect(current).To(Equal(originalInode))
+						// hostNS is the namespace the outer Do switched
+						// away from, i.e. the target namespace.
+						hostInode, err := getInodeNS(hostNS)
+						Expect(err).NotTo(HaveOccurred())
+						Expect(hostInode).To(Equal(targetInode))
+						return nil
+					})
+				})
+				Expect(err).NotTo(HaveOccurred())
+			})
+		})
+
+		Describe("entering a namespace that does not exist", func() {
+			It("fails before touching any namespace state", func() {
+				beforeInode, err := getInodeCurNetNS()
+				Expect(err).NotTo(HaveOccurred())
+
+				missingPath := "/var/run/netns/this-ns-does-not-exist"
+				err = ns.WithNetNSPath(missingPath, func(ns.NetNS) error {
+					Fail("callback must not run for a missing namespace")
+					return nil
+				})
+				Expect(err).To(HaveOccurred())
+				Expect(err).To(BeAssignableToTypeOf(ns.NSPathNotExistErr{}))
+
+				afterInode, err := getInodeCurNetNS()
+				Expect(err).NotTo(HaveOccurred())
+				Expect(afterInode).To(Equal(beforeInode))
+			})
+
+			It("fails on a path that is not a namespace", func() {
+				tempFile, err := os.CreateTemp("", "nstest")
+				Expect(err).NotTo(HaveOccurred())
+				defer tempFile.Close()
+
+				nspath := tempFile.Name()
+				defer os.Remove(nspath)
+
+				err = ns.WithNetNSPath(nspath, func(ns.NetNS) error {
+					Fail("callback must not run for a non-namespace path")
+					return nil
+				})
+				Expect(err).To(HaveOccurred())
+				Expect(err).To(BeAssignableToTypeOf(ns.NSPathNotNSErr{}))
 			})
 		})
 	})
